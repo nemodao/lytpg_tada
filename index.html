@@ -760,12 +760,9 @@ table.apiidx td { vertical-align: middle; }
     if (a && go(a.getAttribute('href'))) { ev.preventDefault(); history.replaceState(null, '', a.getAttribute('href')); closeModal(); }
   });
   sel.addEventListener('change', function () {
-    try { localStorage.setItem('hsb-doc-lang', sel.value); } catch (err) {}
     mount(sel.value, true);
   });
-  var saved = null;
-  try { saved = localStorage.getItem('hsb-doc-lang'); } catch (err) {}
-  mount(saved === 'zh' || saved === 'vi' || saved === 'en' ? saved : 'en', false);
+  mount('en', false);  // luôn mặc định tiếng Anh mỗi lần tải; dropdown vẫn đổi được trong phiên
 })();
 </script>
 </body>

@@ -291,13 +291,17 @@ table.apiidx td { vertical-align: middle; }
 // NEVER include item price / fees / idr_amount (IDR)</pre></div><div class="specsec"><h4>5. Notes</h4><p class="rvnew"><b>COMPLIANCE — do NOT expose IDR monetary values to the front-end</b> (idr_amount, each item's price, fees): a regulatory violation. The app shows Coin only; every IDR amount must be stripped at the backend before returning. <b>Sensitive data</b> (voucher code/PIN, PLN token in <code>serialNumber</code>) is returned only to the order owner; the app masks it and the user taps to reveal. <b>Phase 1 has only the current status</b> (<code>status</code> + <code>last_status_at</code>), no step-by-step timeline yet. Each item has only one of the three blocks e-voucher / token / tracking (render by <code>itemType</code>). <b>Fixed response contract:</b> camelCase keys, ISO-8601 dates (UTC), <code>status</code>/<code>type</code> per the enums in the JSON example — the dev returns exactly this shape so the UI needs no rework.</p></div></div><div class="specsrc" id="spec-int-catalog" data-title="POST /app/point/catalog"><p class="specmeta">Internal · App → HSB · Optional · guest+user · <code>POST {HSB base URL}/app/point/catalog</code></p><p>Gift catalog. Guest (clientId null/0, not logged in) → default group 'direct_client'; a logged-in user → their REAL client_group (from crm_customer_base). Merged from the old catalog-guest.</p><div class="specsec"><h4>1. Preparation</h4><p class="rvnew">Merged from the old <code>catalog-guest</code>. Fetch active gifts via JOIN <code>promo_client_group → point_program → point_featured_gift</code> (EXISTING tables; HSB curates them, not auto-synced from TADA). <code>client_group</code>: guest (<code>clientId</code> null/0) → hardcode <code>'direct_client'</code>; logged-in → derived from <code>crm_customer_base.group_code</code> of <code>clientId</code>.</p></div><div class="specsec"><h4>2. Request</h4><p>The app calls; <code>clientId</code> in the body is optional (empty/null/0 = guest). Guest only needs the static app-key; logged-in sends the app token:</p><div class="scroll"><table><tr><th style="width:20%">Field</th><th style="width:14%">Type</th><th style="width:26%">Example</th><th>Meaning</th></tr><tr><td><code>app token</code></td><td>string</td><td>&lt;app JWT&gt; (only when logged in)</td><td>Guest needs no token; only the static app-key + rate limit.</td></tr></table></div></div><div class="specsec"><h4>3. HSB processing</h4><ol class="conds rvnew">
   <li><b>Guest</b> (<code>clientId</code> null/0): open to users who are not logged in, only <b>static app-key + rate limit</b>, NO token. Use <code>client_group='direct_client'</code> (hardcode).</li>
   <li><b>Logged in</b> (<code>clientId</code> present): validate the app token → <code>client_id</code>; body <code>clientId</code> must match the token, otherwise → <code>403</code>. <code>client_group</code> is derived from <code>crm_customer_base</code> by <code>clientId</code>.</li>
-  <li>Fetch active gifts with the <b>SQL below</b> — one query for both branches via <code>COALESCE</code> (no group found for the user → fall back to <code>'direct_client'</code>).</li>
-  <li>Map each gift → <code>{ id, name, points, image }</code> (points = Coin; <code>id</code> = <code>point_featured_gift.id</code> internal, NOT a TADA deep-link). <b>DROP <code>cash_value</code> (IDR)</b>, <code>external_item_id</code>.</li>
+  <li>Fetch active gifts with the <b>SQL below</b> — one query for both branches via <code>COALESCE</code> (no group found for the user → fall back to <code>'direct_client'</code>). Return <b>ALL</b> enabled gifts in the display window (~50), NOT only <code>show_on_dashboard</code>; ordered by <code>sort_order</code>.</li>
+  <li>Map each gift → <code>{ id, name, points, image, category, description, badge, showOnHome }</code> (points = Coin; <code>category</code> = <code>gift_category</code> (5 keys); <code>description</code> = <code>gift_description</code>; <code>badge</code> = hot/new/null; <code>showOnHome</code> = <code>show_on_dashboard</code>; <code>id</code> = internal <code>point_featured_gift.id</code>). <b>DROP <code>cash_value</code> (IDR)</b>, <code>external_item_id</code>.</li>
   <li>Read-only. When a guest taps redeem → require login before entering the webview flow.</li>
-</ol><pre class="rvnew">SELECT  c.id             AS id,
-        c.gift_name      AS name,
-        c.point_price    AS points,       -- Coin
-        c.gift_image_url AS image
+</ol><pre class="rvnew">SELECT  c.id                AS id,
+        c.gift_name         AS name,
+        c.point_price       AS points,        -- Coin
+        c.gift_image_url    AS image,
+        c.gift_category     AS category,      -- 5 keys: gadget_electronics / tour_travel / shopping_voucher / fnb_voucher / home_living
+        c.gift_description  AS description,    -- one line, may be null
+        c.badge             AS badge,         -- hot / new / '' (treat '' as null)
+        c.show_on_dashboard AS showOnHome     -- Loyalty Home uses only showOnHome=true (first 9)
 FROM        promo_client_group  AS a
 INNER JOIN  point_program        AS b  ON  b.id = a.promo_config_id
 INNER JOIN  point_featured_gift  AS c  ON  c.program_id = b.id
@@ -305,34 +309,40 @@ WHERE   a.promo_table       = 'point_program'    -- hardcode (gift catalog is al
     AND a.enabled           = 1
     AND b.enabled           = 1
     AND c.enabled           = 1
-    AND c.show_on_dashboard = 1
     AND (c.display_from IS NULL OR NOW() &gt;= c.display_from)
     AND (c.display_to   IS NULL OR NOW() &lt;  c.display_to)
     AND a.client_group = COALESCE(
             (SELECT group_code FROM crm_customer_base WHERE client_id = :clientId),
             'direct_client')             -- clientId null/0 (guest) OR not found -&gt; default group
 ORDER BY c.sort_order ASC, c.point_price ASC;
+-- returns ALL enabled gifts in the display window (~50), NOT only show_on_dashboard
 -- do NOT select cash_value (IDR) or external_item_id</pre></div><div class="specsec"><h4>4. Response</h4><p>Backend returns to the app (fixed JSON contract):</p><div class="scroll"><table><tr><th style="width:20%">Field</th><th style="width:14%">Type</th><th style="width:26%">Example</th><th>Meaning</th></tr><tr><td><code>result</code></td><td>object</td><td>{ rewards[] }</td><td>Wrapped in { success, result }. Coin only; NO cash_value / IDR.</td></tr></table></div><p class="specmeta">Fixed JSON contract (the dev returns exactly this shape):</p><pre class="rvnew">POST /app/point/catalog   (body: clientId | null/0 = guest)  -&gt;  200
 {
   "success": true,
   "result": {
     "rewards": [
       {
-        "id": 1,
-        "name": "Saldo GoPay Rp50.000",
-        "points": 500,
-        "image": "https://cdn.hsb.co.id/loyalty/gift/gopay-50k.png"
+        "id": 101,
+        "name": "iPhone 16 Pro",
+        "points": 95000,
+        "image": "https://cdn.hsb.co.id/loyalty/gift/iphone16pro.webp",
+        "category": "gadget_electronics",
+        "description": "256GB, Desert Titanium",
+        "badge": "hot",
+        "showOnHome": true
       }
     ]
   }
 }
 // envelope: { success, result } (same as the existing loyalty API)
+// returns ALL enabled gifts in the client group (~50), NOT only showOnHome; order by sort_order asc
+// showOnHome = show_on_dashboard; Loyalty Home uses only showOnHome=true (first 9)
+// category = gift_category: gadget_electronics | tour_travel | shopping_voucher | fnb_voucher | home_living (null/unknown -&gt; UI "All" tab)
+// description = gift_description (one line, may be null); badge = hot | new | null
 // client_group: guest (clientId null/0) -&gt; 'direct_client'; logged-in -&gt; crm_customer_base.group_code
-// name is in Indonesian (TADA product name; may include a denomination)
 // points = point_price (Coin). NEVER return cash_value / IDR
 // id = point_featured_gift.id (internal key; NOT a TADA deep-link)
-// UI shows up to 9 rewards (10th tile = "Earn more coins", UI-added)
-// guest: no redeem; tapping redeem -&gt; require login</pre></div><div class="specsec"><h4>5. Notes</h4><p class="rvnew"><b>Guest + user merged into one endpoint</b> (drop <code>catalog-guest</code>): <code>clientId</code> null/0 = guest (group <code>'direct_client'</code>, app-key only); with clientId = per user (must match the token). <b>COMPLIANCE:</b> return only <code>points</code> (Coin); NEVER return <code>cash_value</code> or IDR. <code>gift_name</code> may contain a denomination (product name) — HSB owns the column and can rename it if the denomination must be hidden. HSB curates the list (not auto-synced from TADA); the full catalog is in the webview after SSO.</p></div></div><div class="specsrc" id="spec-int-activity" data-title="POST /app/point/activity"><p class="specmeta">Internal · App → HSB · Optional · guest · <code>POST {HSB base URL}/app/point/activity</code></p><p>Recent activity of clients in the Loyalty program: who just earned how many points, who just redeemed what reward — shown on the Home/Earn card. NO token, only x-auth-key; both guests and logged-in users see it.</p><div class="specsec"><h4>1. Preparation</h4><p class="rvnew">Source for <b>coin</b>: <code>point_ledger</code> (all earn rows) — see <code>API/ACTIVITY-COIN-SOURCE.md</code> (Trading Task). Source for <b>gifts</b>: <code>point_redemption_transaction</code> (successful redeem) + <code>point_redemption_order</code> (reward name). <code>N_COIN</code>/<code>N_GIFT</code> in config (default 700 / 300). Protected by <b>x-auth-key</b> + a shared 1–2 min cache + gzip; NO token, NO clientId.</p></div><div class="specsec"><h4>2. Request</h4><p>The app (guest or logged-in) calls with only the x-auth-key header — no Authorization, no clientId:</p></div><div class="specsec"><h4>3. HSB processing</h4><ol class="conds rvnew">
+// guest: no redeem; tapping redeem -&gt; require login</pre></div><div class="specsec"><h4>5. Notes</h4><p class="rvnew"><b>Guest + user merged into one endpoint</b> (drop <code>catalog-guest</code>): <code>clientId</code> null/0 = guest (group <code>'direct_client'</code>, app-key only); with clientId = per user (must match token). <b>Return all ~50 gifts</b> for the Reward Store; Loyalty Home itself filters <code>showOnHome=true</code> (first 9). <code>category</code> = <code>gift_category</code> changed to 5 fixed keys: <code>gadget_electronics / tour_travel / shopping_voucher / fnb_voucher / home_living</code> (unknown/null key → UI "All" tab). <b>COMPLIANCE:</b> return only <code>points</code> (Coin); NEVER return <code>cash_value</code> or IDR. <code>gift_name</code> may contain a denomination (product name) — HSB owns the column. HSB curates the list (not auto-synced from TADA); the full catalog is in the webview after SSO.</p></div></div><div class="specsrc" id="spec-int-activity" data-title="POST /app/point/activity"><p class="specmeta">Internal · App → HSB · Optional · guest · <code>POST {HSB base URL}/app/point/activity</code></p><p>Recent activity of clients in the Loyalty program: who just earned how many points, who just redeemed what reward — shown on the Home/Earn card. NO token, only x-auth-key; both guests and logged-in users see it.</p><div class="specsec"><h4>1. Preparation</h4><p class="rvnew">Source for <b>coin</b>: <code>point_ledger</code> (all earn rows) — see <code>API/ACTIVITY-COIN-SOURCE.md</code> (Trading Task). Source for <b>gifts</b>: <code>point_redemption_transaction</code> (successful redeem) + <code>point_redemption_order</code> (reward name). <code>N_COIN</code>/<code>N_GIFT</code> in config (default 700 / 300). Protected by <b>x-auth-key</b> + a shared 1–2 min cache + gzip; NO token, NO clientId.</p></div><div class="specsec"><h4>2. Request</h4><p>The app (guest or logged-in) calls with only the x-auth-key header — no Authorization, no clientId:</p></div><div class="specsec"><h4>3. HSB processing</h4><ol class="conds rvnew">
   <li>Validate the <b>x-auth-key</b> + rate limit (like <code>guest/tradingTask/get</code>). NO token, NO <code>client_id</code>.</li>
   <li><b>Coin</b> — take the latest <code>N_COIN</code> (default 700) earn rows: <code>point_ledger</code> <code>type=1</code>, <code>source_type=1</code>, <code>point_amount&gt;0</code>. NO join to <code>point_lot</code> (not restricted to the trading task) and NO customer filter — lean, enough. <b>Drop the 7-day window and LIMIT 20</b> of the Trading Task draft.</li>
   <li><b>Gifts</b> — take the latest <code>N_GIFT</code> (default 300) successful redemptions: <code>point_redemption_transaction.status=1</code> (deducted, NOT yet refunded → failed/void orders are excluded as they become status=2); reward name = the first <code>itemName</code> in <code>point_redemption_order.order_items</code>.</li>
@@ -638,13 +648,17 @@ LIMIT :N_GIFT;        -- config, default 300
 // NEVER include item price / fees / idr_amount (IDR)</pre></div><div class="specsec"><h4>5. 注意事项</h4><p class="rvnew"><b>合规 — 不得向前端暴露 IDR 金额</b>（idr_amount、每个 item 的价格、fees）：违反规定。App 仅显示 Coin；所有 IDR 金额必须在后端返回前剔除。<b>敏感数据</b>（voucher code/PIN、<code>serialNumber</code> 中的 PLN token）仅返回给订单所有者；app 默认遮盖，用户点击才显示。<b>Phase 1 仅有当前状态</b>（<code>status</code> + <code>last_status_at</code>），暂无逐步 timeline。每个 item 只有 e-voucher / token / tracking 三个区块中的一个（按 <code>itemType</code> 渲染）。<b>固定响应契约：</b> key 用 camelCase、日期 ISO-8601（UTC）、<code>status</code>/<code>type</code> 按 JSON 示例中的枚举 — dev 返回完全一致的结构，UI 无需返工。</p></div></div><div class="specsrc" id="spec-int-catalog" data-title="POST /app/point/catalog"><p class="specmeta">内部 · App → HSB · 可选 · guest+user · <code>POST {HSB base URL}/app/point/catalog</code></p><p>礼品清单。Guest（clientId null/0，未登录）→ 默认组 'direct_client'；已登录用户 → 其真实 client_group（取自 crm_customer_base）。由旧的 catalog-guest 合并而来。</p><div class="specsec"><h4>1. 准备</h4><p class="rvnew">由旧的 <code>catalog-guest</code> 合并。通过 JOIN <code>promo_client_group → point_program → point_featured_gift</code> 取当前有效礼品（均为已有表；HSB 自行挑选，不自动从 TADA 同步）。<code>client_group</code>：guest（<code>clientId</code> null/0）→ 硬编码 <code>'direct_client'</code>；已登录 → <code>crm_customer_base.group_code</code> 取自 <code>clientId</code>。</p></div><div class="specsec"><h4>2. Request</h4><p>App 调用；body 中 <code>clientId</code> 可选（空/null/0 = guest）。Guest 只需静态 app-key；已登录带 app token：</p><div class="scroll"><table><tr><th style="width:20%">字段</th><th style="width:14%">类型</th><th style="width:26%">示例</th><th>含义</th></tr><tr><td><code>app token</code></td><td>string</td><td>&lt;app JWT&gt;（仅已登录时）</td><td>Guest 无需 token；只需静态 app-key + 限流。</td></tr></table></div></div><div class="specsec"><h4>3. HSB 处理</h4><ol class="conds rvnew">
   <li><b>Guest</b>（<code>clientId</code> null/0）：对未登录用户开放，只需 <b>静态 app-key + 限流</b>，无 token。使用 <code>client_group='direct_client'</code>（硬编码）。</li>
   <li><b>已登录</b>（<code>clientId</code> 有值）：校验 app token → <code>client_id</code>；body <code>clientId</code> 必须与 token 一致，否则 → <code>403</code>。<code>client_group</code> 按 <code>clientId</code> 从 <code>crm_customer_base</code> 推出。</li>
-  <li>用<b>下方 SQL</b> 取有效礼品 — 借助 <code>COALESCE</code> 一条语句覆盖两个分支（按用户找不到组 → 回落到 <code>'direct_client'</code>）。</li>
-  <li>将每个礼品映射为 <code>{ id, name, points, image }</code>（points = Coin；<code>id</code> = <code>point_featured_gift.id</code> 内部键，非 TADA deep-link）。<b>去掉 <code>cash_value</code>（IDR）</b>、<code>external_item_id</code>。</li>
+  <li>用<b>下方 SQL</b> 取有效礼品 — 借助 <code>COALESCE</code> 一条语句覆盖两个分支（按用户找不到组 → 回落到 <code>'direct_client'</code>）。返回显示窗口内<b>所有</b>已启用礼品（约 50 个），不只是 <code>show_on_dashboard</code>；按 <code>sort_order</code> 排序。</li>
+  <li>将每个礼品映射为 → <code>{ id, name, points, image, category, description, badge, showOnHome }</code>（points = Coin；<code>category</code> = <code>gift_category</code>（5 个 key）；<code>description</code> = <code>gift_description</code>；<code>badge</code> = hot/new/null；<code>showOnHome</code> = <code>show_on_dashboard</code>；<code>id</code> = 内部 <code>point_featured_gift.id</code>）。<b>去掉 <code>cash_value</code>（IDR）</b>、<code>external_item_id</code>。</li>
   <li>只读。Guest 点 redeem → 先要求登录再进入 webview 流程。</li>
-</ol><pre class="rvnew">SELECT  c.id             AS id,
-        c.gift_name      AS name,
-        c.point_price    AS points,       -- Coin
-        c.gift_image_url AS image
+</ol><pre class="rvnew">SELECT  c.id                AS id,
+        c.gift_name         AS name,
+        c.point_price       AS points,        -- Coin
+        c.gift_image_url    AS image,
+        c.gift_category     AS category,      -- 5 keys: gadget_electronics / tour_travel / shopping_voucher / fnb_voucher / home_living
+        c.gift_description  AS description,    -- one line, may be null
+        c.badge             AS badge,         -- hot / new / '' (treat '' as null)
+        c.show_on_dashboard AS showOnHome     -- Loyalty Home uses only showOnHome=true (first 9)
 FROM        promo_client_group  AS a
 INNER JOIN  point_program        AS b  ON  b.id = a.promo_config_id
 INNER JOIN  point_featured_gift  AS c  ON  c.program_id = b.id
@@ -652,34 +666,40 @@ WHERE   a.promo_table       = 'point_program'    -- hardcode (gift catalog is al
     AND a.enabled           = 1
     AND b.enabled           = 1
     AND c.enabled           = 1
-    AND c.show_on_dashboard = 1
     AND (c.display_from IS NULL OR NOW() &gt;= c.display_from)
     AND (c.display_to   IS NULL OR NOW() &lt;  c.display_to)
     AND a.client_group = COALESCE(
             (SELECT group_code FROM crm_customer_base WHERE client_id = :clientId),
             'direct_client')             -- clientId null/0 (guest) OR not found -&gt; default group
 ORDER BY c.sort_order ASC, c.point_price ASC;
+-- returns ALL enabled gifts in the display window (~50), NOT only show_on_dashboard
 -- do NOT select cash_value (IDR) or external_item_id</pre></div><div class="specsec"><h4>4. Response</h4><p>后端返回给 app（固定 JSON 契约）：</p><div class="scroll"><table><tr><th style="width:20%">字段</th><th style="width:14%">类型</th><th style="width:26%">示例</th><th>含义</th></tr><tr><td><code>result</code></td><td>object</td><td>{ rewards[] }</td><td>包裹在 { success, result } 中。仅 Coin；没有 cash_value / IDR。</td></tr></table></div><p class="specmeta">固定 JSON 契约（dev 必须返回此结构）：</p><pre class="rvnew">POST /app/point/catalog   (body: clientId | null/0 = guest)  -&gt;  200
 {
   "success": true,
   "result": {
     "rewards": [
       {
-        "id": 1,
-        "name": "Saldo GoPay Rp50.000",
-        "points": 500,
-        "image": "https://cdn.hsb.co.id/loyalty/gift/gopay-50k.png"
+        "id": 101,
+        "name": "iPhone 16 Pro",
+        "points": 95000,
+        "image": "https://cdn.hsb.co.id/loyalty/gift/iphone16pro.webp",
+        "category": "gadget_electronics",
+        "description": "256GB, Desert Titanium",
+        "badge": "hot",
+        "showOnHome": true
       }
     ]
   }
 }
 // envelope: { success, result } (same as the existing loyalty API)
+// returns ALL enabled gifts in the client group (~50), NOT only showOnHome; order by sort_order asc
+// showOnHome = show_on_dashboard; Loyalty Home uses only showOnHome=true (first 9)
+// category = gift_category: gadget_electronics | tour_travel | shopping_voucher | fnb_voucher | home_living (null/unknown -&gt; UI "All" tab)
+// description = gift_description (one line, may be null); badge = hot | new | null
 // client_group: guest (clientId null/0) -&gt; 'direct_client'; logged-in -&gt; crm_customer_base.group_code
-// name is in Indonesian (TADA product name; may include a denomination)
 // points = point_price (Coin). NEVER return cash_value / IDR
 // id = point_featured_gift.id (internal key; NOT a TADA deep-link)
-// UI shows up to 9 rewards (10th tile = "Earn more coins", UI-added)
-// guest: no redeem; tapping redeem -&gt; require login</pre></div><div class="specsec"><h4>5. 注意事项</h4><p class="rvnew"><b>guest + user 合并为一个 endpoint</b>（去掉 <code>catalog-guest</code>）：<code>clientId</code> null/0 = guest（组 <code>'direct_client'</code>，仅 app-key）；带 clientId = 按用户（须与 token 一致）。<b>合规：</b> 只返回 <code>points</code>（Coin）；绝不返回 <code>cash_value</code> 或 IDR。<code>gift_name</code> 可能含面额（产品名）— HSB 自管该列，必要时可改名以隐藏面额。列表由 HSB 挑选（不自动从 TADA 同步）；完整 catalog 在 SSO 后的 webview 中查看。</p></div></div><div class="specsrc" id="spec-int-activity" data-title="POST /app/point/activity"><p class="specmeta">内部 · App → HSB · 可选 · guest · <code>POST {HSB base URL}/app/point/activity</code></p><p>Loyalty 计划中客户的近期动态：谁刚获得多少 point、谁刚兑换了什么礼品 — 显示在 Home/Earn 卡片。无 token，仅 x-auth-key；guest 与已登录用户都可见。</p><div class="specsec"><h4>1. 准备</h4><p class="rvnew">coin <b>来源</b>：<code>point_ledger</code>（所有 earn 行）— 参考 <code>API/ACTIVITY-COIN-SOURCE.md</code>（Trading Task）。礼品<b>来源</b>：<code>point_redemption_transaction</code>（成功 redeem）+ <code>point_redemption_order</code>（礼品名）。<code>N_COIN</code>/<code>N_GIFT</code> 在 config（默认 700 / 300）。用 <b>x-auth-key</b> + 共享 1–2 分钟缓存 + gzip 保护；无 token，无 clientId。</p></div><div class="specsec"><h4>2. Request</h4><p>App（guest 或已登录）调用，仅 x-auth-key header — 无 Authorization，无 clientId：</p></div><div class="specsec"><h4>3. HSB 处理</h4><ol class="conds rvnew">
+// guest: no redeem; tapping redeem -&gt; require login</pre></div><div class="specsec"><h4>5. 注意事项</h4><p class="rvnew"><b>guest + user 合并为一个 endpoint</b>（去掉 <code>catalog-guest</code>）：<code>clientId</code> null/0 = guest（组 <code>'direct_client'</code>，仅 app-key）；带 clientId = 按用户（须与 token 一致）。<b>为 Reward Store 返回全部约 50 个礼品</b>；Loyalty Home 自行过滤 <code>showOnHome=true</code>（前 9 个）。<code>category</code> = <code>gift_category</code> 改为 5 个固定 key：<code>gadget_electronics / tour_travel / shopping_voucher / fnb_voucher / home_living</code>（未知/null key → UI 的 "All" 标签）。<b>合规：</b> 只返回 <code>points</code>（Coin）；绝不返回 <code>cash_value</code> 或 IDR。<code>gift_name</code> 可能含面额（产品名）— HSB 自管该列。列表由 HSB 挑选（不自动从 TADA 同步）；完整 catalog 在 SSO 后的 webview 中查看。</p></div></div><div class="specsrc" id="spec-int-activity" data-title="POST /app/point/activity"><p class="specmeta">内部 · App → HSB · 可选 · guest · <code>POST {HSB base URL}/app/point/activity</code></p><p>Loyalty 计划中客户的近期动态：谁刚获得多少 point、谁刚兑换了什么礼品 — 显示在 Home/Earn 卡片。无 token，仅 x-auth-key；guest 与已登录用户都可见。</p><div class="specsec"><h4>1. 准备</h4><p class="rvnew">coin <b>来源</b>：<code>point_ledger</code>（所有 earn 行）— 参考 <code>API/ACTIVITY-COIN-SOURCE.md</code>（Trading Task）。礼品<b>来源</b>：<code>point_redemption_transaction</code>（成功 redeem）+ <code>point_redemption_order</code>（礼品名）。<code>N_COIN</code>/<code>N_GIFT</code> 在 config（默认 700 / 300）。用 <b>x-auth-key</b> + 共享 1–2 分钟缓存 + gzip 保护；无 token，无 clientId。</p></div><div class="specsec"><h4>2. Request</h4><p>App（guest 或已登录）调用，仅 x-auth-key header — 无 Authorization，无 clientId：</p></div><div class="specsec"><h4>3. HSB 处理</h4><ol class="conds rvnew">
   <li>校验 <b>x-auth-key</b> + 限流（类似 <code>guest/tradingTask/get</code>）。无 token，无 <code>client_id</code>。</li>
   <li><b>Coin</b> — 取最新 <code>N_COIN</code>（默认 700）条 earn 行：<code>point_ledger</code> <code>type=1</code>、<code>source_type=1</code>、<code>point_amount&gt;0</code>。不 join <code>point_lot</code>（不限于 trading task），也不过滤客户 — 精简够用。<b>去掉 7 天窗口与 LIMIT 20</b>（Trading Task 草案）。</li>
   <li><b>礼品</b> — 取最新 <code>N_GIFT</code>（默认 300）条成功 redeem：<code>point_redemption_transaction.status=1</code>（已扣、尚未退回 → fail/void 订单因变为 status=2 而排除）；礼品名 = <code>point_redemption_order.order_items</code> 中第一个 <code>itemName</code>。</li>
@@ -985,13 +1005,17 @@ LIMIT :N_GIFT;        -- config, default 300
 // NEVER include item price / fees / idr_amount (IDR)</pre></div><div class="specsec"><h4>5. Lưu ý</h4><p class="rvnew"><b>TUÂN THỦ — KHÔNG đưa giá trị tiền IDR ra front-end</b> (idr_amount, giá tiền từng item, fees): vi phạm quy định. App chỉ hiển thị Coin; mọi số tiền IDR phải bị strip ở backend trước khi trả. <b>Dữ liệu nhạy cảm</b> (voucher code/PIN, token PLN ở <code>serialNumber</code>) chỉ trả cho chủ đơn; app che sẵn, user bấm mới hiện. <b>Phase 1 chỉ có trạng thái hiện tại</b> (<code>status</code> + <code>last_status_at</code>), chưa có timeline từng bước. Mỗi item chỉ có 1 trong 3 khối e-voucher / token / tracking (render theo <code>itemType</code>). <b>Quy ước cố định của response:</b> key dạng camelCase, ngày ISO-8601 (UTC), <code>status</code>/<code>type</code> theo enum ở ví dụ JSON — dev trả đúng shape này để UI không phải sửa.</p></div></div><div class="specsrc" id="spec-int-catalog" data-title="POST /app/point/catalog"><p class="specmeta">Nội bộ · App → HSB · Tùy chọn · guest+user · <code>POST {HSB base URL}/app/point/catalog</code></p><p>Danh sách quà. Guest (clientId null/0, chưa đăng nhập) → nhóm mặc định 'direct_client'; user đã đăng nhập → client_group THẬT của họ (suy từ crm_customer_base). Gộp từ catalog-guest cũ.</p><div class="specsec"><h4>1. Chuẩn bị</h4><p class="rvnew">Gộp từ <code>catalog-guest</code> cũ. Lấy quà đang active qua JOIN <code>promo_client_group → point_program → point_featured_gift</code> (các bảng SẴN CÓ; HSB tự tuyển, không sync tự động từ TADA). <code>client_group</code>: guest (<code>clientId</code> null/0) → hardcode <code>'direct_client'</code>; đã đăng nhập → suy từ <code>crm_customer_base.group_code</code> của <code>clientId</code>.</p></div><div class="specsec"><h4>2. Request</h4><p>App gọi; <code>clientId</code> trong body tùy chọn (rỗng/null/0 = guest). Guest chỉ cần app-key tĩnh; đã đăng nhập kèm app token:</p><div class="scroll"><table><tr><th style="width:20%">Trường</th><th style="width:14%">Kiểu</th><th style="width:26%">Ví dụ</th><th>Ý nghĩa</th></tr><tr><td><code>app token</code></td><td>string</td><td>&lt;app JWT&gt; (chỉ khi đã đăng nhập)</td><td>Guest không cần token; chỉ cần app-key tĩnh + rate limit.</td></tr></table></div></div><div class="specsec"><h4>3. HSB xử lý</h4><ol class="conds rvnew">
   <li><b>Guest</b> (<code>clientId</code> null/0): mở cho khách chưa đăng nhập, chỉ cần <b>app-key tĩnh + rate limit</b>, KHÔNG token. Dùng <code>client_group='direct_client'</code> (hardcode).</li>
   <li><b>Đã đăng nhập</b> (<code>clientId</code> có giá trị): validate app token → <code>client_id</code>; body <code>clientId</code> phải khớp token, sai → <code>403</code>. <code>client_group</code> suy từ <code>crm_customer_base</code> theo <code>clientId</code>.</li>
-  <li>Lấy quà active bằng <b>truy vấn SQL bên dưới</b> — 1 câu cho cả 2 nhánh nhờ <code>COALESCE</code> (không tìm được group theo user → về <code>'direct_client'</code>).</li>
-  <li>Map mỗi quà → <code>{ id, name, points, image }</code> (points = Coin; <code>id</code> = <code>point_featured_gift.id</code> nội bộ, KHÔNG phải deep-link TADA). <b>BỎ <code>cash_value</code> (IDR)</b>, <code>external_item_id</code>.</li>
+  <li>Lấy quà active bằng <b>truy vấn SQL bên dưới</b> — 1 câu cho cả 2 nhánh nhờ <code>COALESCE</code> (không tìm được group theo user → về <code>'direct_client'</code>). Trả <b>TẤT CẢ</b> quà đang bật trong khung hiển thị (~50 món), KHÔNG chỉ <code>show_on_dashboard</code>; sắp theo <code>sort_order</code>.</li>
+  <li>Map mỗi quà → <code>{ id, name, points, image, category, description, badge, showOnHome }</code> (points = Coin; <code>category</code> = <code>gift_category</code> (5 key); <code>description</code> = <code>gift_description</code>; <code>badge</code> = hot/new/null; <code>showOnHome</code> = <code>show_on_dashboard</code>; <code>id</code> = <code>point_featured_gift.id</code> nội bộ). <b>BỎ <code>cash_value</code> (IDR)</b>, <code>external_item_id</code>.</li>
   <li>Read-only. Guest bấm redeem → yêu cầu đăng nhập rồi mới vào luồng webview.</li>
-</ol><pre class="rvnew">SELECT  c.id             AS id,
-        c.gift_name      AS name,
-        c.point_price    AS points,       -- Coin
-        c.gift_image_url AS image
+</ol><pre class="rvnew">SELECT  c.id                AS id,
+        c.gift_name         AS name,
+        c.point_price       AS points,        -- Coin
+        c.gift_image_url    AS image,
+        c.gift_category     AS category,      -- 5 keys: gadget_electronics / tour_travel / shopping_voucher / fnb_voucher / home_living
+        c.gift_description  AS description,    -- one line, may be null
+        c.badge             AS badge,         -- hot / new / '' (treat '' as null)
+        c.show_on_dashboard AS showOnHome     -- Loyalty Home uses only showOnHome=true (first 9)
 FROM        promo_client_group  AS a
 INNER JOIN  point_program        AS b  ON  b.id = a.promo_config_id
 INNER JOIN  point_featured_gift  AS c  ON  c.program_id = b.id
@@ -999,34 +1023,40 @@ WHERE   a.promo_table       = 'point_program'    -- hardcode (gift catalog is al
     AND a.enabled           = 1
     AND b.enabled           = 1
     AND c.enabled           = 1
-    AND c.show_on_dashboard = 1
     AND (c.display_from IS NULL OR NOW() &gt;= c.display_from)
     AND (c.display_to   IS NULL OR NOW() &lt;  c.display_to)
     AND a.client_group = COALESCE(
             (SELECT group_code FROM crm_customer_base WHERE client_id = :clientId),
             'direct_client')             -- clientId null/0 (guest) OR not found -&gt; default group
 ORDER BY c.sort_order ASC, c.point_price ASC;
+-- returns ALL enabled gifts in the display window (~50), NOT only show_on_dashboard
 -- do NOT select cash_value (IDR) or external_item_id</pre></div><div class="specsec"><h4>4. Response</h4><p>Backend trả về app (hợp đồng JSON cố định):</p><div class="scroll"><table><tr><th style="width:20%">Trường</th><th style="width:14%">Kiểu</th><th style="width:26%">Ví dụ</th><th>Ý nghĩa</th></tr><tr><td><code>result</code></td><td>object</td><td>{ rewards[] }</td><td>Nằm trong vỏ { success, result }. Chỉ Coin; KHÔNG có cash_value / IDR.</td></tr></table></div><p class="specmeta">Hợp đồng JSON cố định (dev trả đúng shape này):</p><pre class="rvnew">POST /app/point/catalog   (body: clientId | null/0 = guest)  -&gt;  200
 {
   "success": true,
   "result": {
     "rewards": [
       {
-        "id": 1,
-        "name": "Saldo GoPay Rp50.000",
-        "points": 500,
-        "image": "https://cdn.hsb.co.id/loyalty/gift/gopay-50k.png"
+        "id": 101,
+        "name": "iPhone 16 Pro",
+        "points": 95000,
+        "image": "https://cdn.hsb.co.id/loyalty/gift/iphone16pro.webp",
+        "category": "gadget_electronics",
+        "description": "256GB, Desert Titanium",
+        "badge": "hot",
+        "showOnHome": true
       }
     ]
   }
 }
 // envelope: { success, result } (same as the existing loyalty API)
+// returns ALL enabled gifts in the client group (~50), NOT only showOnHome; order by sort_order asc
+// showOnHome = show_on_dashboard; Loyalty Home uses only showOnHome=true (first 9)
+// category = gift_category: gadget_electronics | tour_travel | shopping_voucher | fnb_voucher | home_living (null/unknown -&gt; UI "All" tab)
+// description = gift_description (one line, may be null); badge = hot | new | null
 // client_group: guest (clientId null/0) -&gt; 'direct_client'; logged-in -&gt; crm_customer_base.group_code
-// name is in Indonesian (TADA product name; may include a denomination)
 // points = point_price (Coin). NEVER return cash_value / IDR
 // id = point_featured_gift.id (internal key; NOT a TADA deep-link)
-// UI shows up to 9 rewards (10th tile = "Earn more coins", UI-added)
-// guest: no redeem; tapping redeem -&gt; require login</pre></div><div class="specsec"><h4>5. Lưu ý</h4><p class="rvnew"><b>Gộp guest + user vào 1 endpoint</b> (bỏ <code>catalog-guest</code>): <code>clientId</code> null/0 = guest (group <code>'direct_client'</code>, chỉ app-key), có clientId = theo user (khớp token). <b>TUÂN THỦ:</b> chỉ trả <code>points</code> (Coin); KHÔNG trả <code>cash_value</code> hay IDR. <code>gift_name</code> có thể chứa mệnh giá (tên sản phẩm) — HSB tự quản cột, có thể đặt lại tên nếu cần ẩn mệnh giá. Danh sách HSB tự tuyển (không sync tự động TADA); full catalog xem trong webview sau SSO.</p></div></div><div class="specsrc" id="spec-int-activity" data-title="POST /app/point/activity"><p class="specmeta">Nội bộ · App → HSB · Tùy chọn · guest · <code>POST {HSB base URL}/app/point/activity</code></p><p>Hoạt động gần đây của các client trong chương trình Loyalty: ai vừa nhận bao nhiêu point, ai vừa đổi quà gì — hiển thị ở thẻ Home/Earn. KHÔNG token, chỉ x-auth-key; cả guest lẫn user đã login đều xem.</p><div class="specsec"><h4>1. Chuẩn bị</h4><p class="rvnew">Nguồn <b>coin</b>: <code>point_ledger</code> (mọi dòng earn) — tham khảo <code>API/ACTIVITY-COIN-SOURCE.md</code> (Trading Task). Nguồn <b>quà</b>: <code>point_redemption_transaction</code> (redeem thành công) + <code>point_redemption_order</code> (tên quà). <code>N_COIN</code>/<code>N_GIFT</code> ở config (mặc định 700 / 300). Bảo vệ bằng <b>x-auth-key</b> + cache dùng chung 1–2 phút + gzip; KHÔNG token, KHÔNG clientId.</p></div><div class="specsec"><h4>2. Request</h4><p>App (guest hoặc đã login) gọi, chỉ header x-auth-key — không Authorization, không clientId:</p></div><div class="specsec"><h4>3. HSB xử lý</h4><ol class="conds rvnew">
+// guest: no redeem; tapping redeem -&gt; require login</pre></div><div class="specsec"><h4>5. Lưu ý</h4><p class="rvnew"><b>Gộp guest + user vào 1 endpoint</b> (bỏ <code>catalog-guest</code>): <code>clientId</code> null/0 = guest (group <code>'direct_client'</code>, chỉ app-key), có clientId = theo user (khớp token). <b>Trả hết ~50 món</b> cho trang Reward Store; Loyalty Home tự lọc <code>showOnHome=true</code> (9 món đầu). <code>category</code> = <code>gift_category</code> đổi sang 5 key cố định: <code>gadget_electronics / tour_travel / shopping_voucher / fnb_voucher / home_living</code> (key lạ/null → UI để tab "All"). <b>TUÂN THỦ:</b> chỉ trả <code>points</code> (Coin); KHÔNG trả <code>cash_value</code> hay IDR. <code>gift_name</code> có thể chứa mệnh giá (tên sản phẩm) — HSB tự quản cột. Danh sách HSB tự tuyển (không sync tự động TADA); full catalog xem trong webview sau SSO.</p></div></div><div class="specsrc" id="spec-int-activity" data-title="POST /app/point/activity"><p class="specmeta">Nội bộ · App → HSB · Tùy chọn · guest · <code>POST {HSB base URL}/app/point/activity</code></p><p>Hoạt động gần đây của các client trong chương trình Loyalty: ai vừa nhận bao nhiêu point, ai vừa đổi quà gì — hiển thị ở thẻ Home/Earn. KHÔNG token, chỉ x-auth-key; cả guest lẫn user đã login đều xem.</p><div class="specsec"><h4>1. Chuẩn bị</h4><p class="rvnew">Nguồn <b>coin</b>: <code>point_ledger</code> (mọi dòng earn) — tham khảo <code>API/ACTIVITY-COIN-SOURCE.md</code> (Trading Task). Nguồn <b>quà</b>: <code>point_redemption_transaction</code> (redeem thành công) + <code>point_redemption_order</code> (tên quà). <code>N_COIN</code>/<code>N_GIFT</code> ở config (mặc định 700 / 300). Bảo vệ bằng <b>x-auth-key</b> + cache dùng chung 1–2 phút + gzip; KHÔNG token, KHÔNG clientId.</p></div><div class="specsec"><h4>2. Request</h4><p>App (guest hoặc đã login) gọi, chỉ header x-auth-key — không Authorization, không clientId:</p></div><div class="specsec"><h4>3. HSB xử lý</h4><ol class="conds rvnew">
   <li>Validate <b>x-auth-key</b> + rate limit (như <code>guest/tradingTask/get</code>). KHÔNG token, KHÔNG <code>client_id</code>.</li>
   <li><b>Coin</b> — lấy <code>N_COIN</code> (mặc định 700) dòng earn mới nhất: <code>point_ledger</code> <code>type=1</code>, <code>source_type=1</code>, <code>point_amount&gt;0</code>. KHÔNG join <code>point_lot</code> (không giới hạn theo task trading) và KHÔNG lọc khách — gọn, đủ dùng. <b>BỎ điều kiện 7 ngày và LIMIT 20</b> của bản Trading Task.</li>
   <li><b>Quà</b> — lấy <code>N_GIFT</code> (mặc định 300) redeem thành công mới nhất: <code>point_redemption_transaction.status=1</code> (đã trừ, CHƯA hoàn → loại đơn fail/void vì chúng thành status=2); tên quà = <code>itemName</code> đầu trong <code>point_redemption_order.order_items</code>.</li>
